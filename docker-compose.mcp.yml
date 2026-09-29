@@ -1,0 +1,54 @@
+version: "3.8"
+
+services:
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    image: billionmail/mcp-server:latest
+    container_name: billionmail-mcp-server
+    ports:
+      - "9090:9090"
+    environment:
+      - MCP_PORT=9090
+      - BILLIONMAIL_HOSTNAME=mail.cargoffer.com
+    volumes:
+      - ./core/data:/root/data
+    depends_on:
+      - pgsql-billionmail
+      - redis-billionmail
+    restart: unless-stopped
+
+  pgsql-billionmail:
+    image: postgres:17.4-alpine
+    container_name: billionmail-pgsql
+    environment:
+      POSTGRES_DB: billionmail
+      POSTGRES_USER: billionmail
+      POSTGRES_PASSWORD: Xy7qLm9nRt2pKw4vCd5
+    volumes:
+      - pgsql-data:/var/lib/postgresql/data
+      - ./postgresql-socket:/var/run/postgresql
+    ports:
+      - "127.0.0.1:25433:5432"
+    networks:
+      - billionmail-network
+
+  redis-billionmail:
+    image: redis:7.4.2-alpine
+    container_name: billionmail-redis
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    ports:
+      - "127.0.0.1:26380:6379"
+    networks:
+      - billionmail-network
+
+volumes:
+  pgsql-data:
+  redis-data:
+
+networks:
+  billionmail-network:
+    driver: bridge
