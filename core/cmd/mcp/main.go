@@ -1,3 +1,7 @@
+// BillionMail MCP Server
+// Exposes BillionMail management operations as MCP tools over Streamable HTTP.
+// It is a thin HTTP client of the BillionMail core REST API (no internal imports),
+// so it builds standalone and can run beside the core container.
 package main
 
 import (
@@ -9,99 +13,173 @@ import (
 	"os"
 	"strconv"
 
-	"billionmail-core/mcp"
-	"github.com/modelcontextprotocol/go-sdk"
-	"github.com/modelcontextprotocol/go-sdk/jsonschema"
+	bm "billionmail-core/mcp"
 )
 
-var server *mcp.MCPServer
+// toolRequest is the minimal JSON-RPC shape we need to serve MCP tool calls.
+type toolRequest struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id"`
+	Method  string          `json:"method"`
+	Params  struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	} `json:"params"`
+}
+
+type toolResponse struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id"`
+	Result  any             `json:"result,omitempty"`
+	Error   *rpcError       `json:"error,omitempty"`
+}
+
+type rpcError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+// textResult wraps output as MCP content blocks
+func textResult(v any) map[string]any {
+	b, _ := json.MarshalIndent(v, "", "  ")
+	return map[string]any{
+		"content": []map[string]any{
+			{"type": "text", "text": string(b)},
+		},
+	}
+}
 
 func main() {
-	// Initialize BillionMail MCP server
-	server = mcp.NewMCPServer()
+	ctx := context.Background()
+	client := bm.NewClientFromEnv()
 
-	// Create MCP server
-	mcpServer := sdk.NewServer("billionmail-server", "1.0.0", &sdk.ServerOptions{
-		Capabilities: sdk.Capabilities{
-			Tools: &sdk.ToolCapabilities{ListChanged: true},
-		},
+	// Fail fast if the core is unreachable / credentials are wrong.
+	if err := client.Login(ctx); err != nil {
+		log.Printf("warning: initial login failed (%v) — will retry on first tool call", err)
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
 	})
 
-	// Register tools
-	mcpServer.AddTool("list_domains", "List all configured mail domains",
-		jsonschema.Object{"type": "object"},
-		func(ctx context.Context, _ *sdk.ToolParams) (any, error) {
-			return server.ListDomains(ctx)
-		})
+	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
+		var req toolRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeErr(w, nil, -32700, "parse error: "+err.Error())
+			return
+		}
 
-	mcpServer.AddTool("get_smtp_status", "Get SMTP server status",
-		jsonschema.Object{"type": "object"},
-		func(ctx context.Context, _ *sdk.ToolParams) (any, error) {
-			return server.GetSMTPStatus(ctx)
-		})
+		switch req.Method {
+		case "initialize":
+			writeOK(w, req.ID, map[string]any{
+				"protocolVersion": "2024-11-05",
+				"capabilities":    map[string]any{"tools": map[string]any{}},
+				"serverInfo":      map[string]any{"name": "billionmail-mcp", "version": "1.0.0"},
+			})
+		case "tools/list":
+			writeOK(w, req.ID, map[string]any{"tools": toolsSchema()})
+		case "tools/call":
+			result, err := dispatch(ctx, client, req.Params.Name, req.Params.Arguments)
+			if err != nil {
+				writeErr(w, req.ID, -32000, err.Error())
+				return
+			}
+			writeOK(w, req.ID, textResult(result))
+		case "notifications/initialized":
+			writeOK(w, req.ID, map[string]any{})
+		default:
+			writeErr(w, req.ID, -32601, "method not supported: "+req.Method)
+		}
+	})
 
-	mcpServer.AddTool("create_domain", "Create a new mail domain",
-		jsonschema.Object{
-			"properties": map[string]any{
-				"domain": map[string]any{"type": "string", "description": "Domain name to create"},
-				"a_record": map[string]any{"type": "string", "description": "A record IP address"},
-				"active": map[string]any{"type": "boolean", "default": true},
-				"auto_dkim": map[string]any{"type": "boolean", "description": "Generate DKIM automatically", "default": false},
-			},
-			"required": []any{"domain"},
-		},
-		func(ctx context.Context, p *sdk.ToolParams) (any, error) {
-			var params mcp.CreateDomainParams
-			params.Domain = p.Params.(map[string]any)["domain"].(string)
-			if a, ok := p.Params.(map[string]any)["a_record"].(string); ok {
-				params.A_Record = a
-			}
-			if a, ok := p.Params.(map[string]any)["active"].(bool); ok {
-				params.Active = a
-			}
-			if a, ok := p.Params.(map[string]any)["auto_dkim"].(bool); ok {
-				params.AutoDKIM = a
-			}
-			return server.CreateDomain(ctx, params)
-		},
-	)
-
-	mcpServer.AddTool("create_mailbox", "Create a new mailbox",
-		jsonschema.Object{
-			"properties": map[string]any{
-				"username": map[string]any{"type": "string", "description": "Mailbox username"},
-				"domain": map[string]any{"type": "string", "description": "Domain name"},
-				"password": map[string]any{"type": "string", "description": "Mailbox password"},
-			},
-			"required": []any{"username", "domain"},
-		},
-		func(ctx context.Context, p *sdk.ToolParams) (any, error) {
-			params := p.Params.(map[string]any)
-			username := params["username"].(string)
-			domain := params["domain"].(string)
-			password := ""
-			if pw, ok := params["password"].(string); ok {
-				password = pw
-			}
-			return server.CreateMailbox(ctx, username, domain, password)
-		},
-	)
-
-	// Get port from env or default to 8081
-	port := 8081
+	port := 9090
 	if p := os.Getenv("MCP_PORT"); p != "" {
-		if parsed, err := strconv.Atoi(p); err == nil {
-			port = parsed
+		if v, err := strconv.Atoi(p); err == nil {
+			port = v
 		}
 	}
 
-	// Start HTTP server for MCP
-	http.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
-		mcpServer.ServeHTTP(w, r)
-	})
+	log.Printf("BillionMail MCP server listening on :%d/mcp (core: %s)", port, os.Getenv("BILLIONMAIL_URL"))
+	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", port), mux))
+}
 
-	log.Printf("BillionMail MCP Server starting on :%d", port)
-	if err := http.ListenAndServe(fmt.Sprintf(":%d", port), nil); err != nil {
-		log.Fatalf("MCP server failed: %v", err)
+func dispatch(ctx context.Context, client *bm.Client, name string, args json.RawMessage) (any, error) {
+	var a map[string]any
+	if len(args) > 0 {
+		_ = json.Unmarshal(args, &a)
 	}
+	str := func(k string) string {
+		if v, ok := a[k].(string); ok {
+			return v
+		}
+		return ""
+	}
+
+	switch name {
+	case "list_domains":
+		return client.ListDomains(ctx)
+	case "create_domain":
+		d := str("domain")
+		if d == "" {
+			return nil, fmt.Errorf("missing required argument: domain")
+		}
+		return client.CreateDomain(ctx, d, str("a_record"))
+	case "delete_domain":
+		d := str("domain")
+		if d == "" {
+			return nil, fmt.Errorf("missing required argument: domain")
+		}
+		return client.DeleteDomain(ctx, d)
+	case "create_mailbox":
+		u, d := str("username"), str("domain")
+		if u == "" || d == "" {
+			return nil, fmt.Errorf("missing required arguments: username, domain")
+		}
+		return client.CreateMailbox(ctx, u, d, str("password"))
+	case "list_mailboxes":
+		return client.ListMailboxes(ctx, str("domain"))
+	case "get_service_status":
+		return client.GetServiceStatus(ctx)
+	case "get_overview":
+		return client.GetOverview(ctx)
+	default:
+		return nil, fmt.Errorf("unknown tool: %s", name)
+	}
+}
+
+func toolsSchema() []map[string]any {
+	schema := func(props map[string]any, required ...string) map[string]any {
+		return map[string]any{"type": "object", "properties": props, "required": required}
+	}
+	s := func(desc string) map[string]any { return map[string]any{"type": "string", "description": desc} }
+
+	return []map[string]any{
+		{"name": "list_domains", "description": "List all configured mail domains", "inputSchema": schema(map[string]any{})},
+		{"name": "create_domain", "description": "Create a new mail domain", "inputSchema": schema(
+			map[string]any{"domain": s("Domain name"), "a_record": s("A record IP (optional)")}, "domain")},
+		{"name": "delete_domain", "description": "Delete a mail domain", "inputSchema": schema(
+			map[string]any{"domain": s("Domain name")}, "domain")},
+		{"name": "create_mailbox", "description": "Create a mailbox user@domain", "inputSchema": schema(
+			map[string]any{"username": s("Mailbox username"), "domain": s("Domain name"), "password": s("Password")},
+			"username", "domain")},
+		{"name": "list_mailboxes", "description": "List mailboxes, optionally filtered by domain", "inputSchema": schema(
+			map[string]any{"domain": s("Filter by domain (optional)")})},
+		{"name": "get_service_status", "description": "Get SMTP/IMAP/POP service status", "inputSchema": schema(map[string]any{})},
+		{"name": "get_overview", "description": "Get platform overview stats", "inputSchema": schema(map[string]any{})},
+	}
+}
+
+func writeOK(w http.ResponseWriter, id json.RawMessage, result any) {
+	writeJSON(w, toolResponse{JSONRPC: "2.0", ID: id, Result: result})
+}
+
+func writeErr(w http.ResponseWriter, id json.RawMessage, code int, msg string) {
+	writeJSON(w, toolResponse{JSONRPC: "2.0", ID: id, Error: &rpcError{Code: code, Message: msg}})
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(v)
 }

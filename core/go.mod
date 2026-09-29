@@ -12,9 +12,8 @@ require (
 	github.com/gogf/gf/contrib/drivers/pgsql/v2 v2.9.0
 	github.com/gogf/gf/contrib/nosql/redis/v2 v2.9.0
 	github.com/gogf/gf/v2 v2.10.0
-		"github.com/golang-jwt/jwt/v5 v5.3.1
-		"github.com/modelcontextprotocol/go-sdk v0.3.0
-		"github.com/google/uuid v1.6.0
+	github.com/golang-jwt/jwt/v5 v5.3.1
+	github.com/google/uuid v1.6.0
 	github.com/miekg/dns v1.1.72
 	github.com/mojocn/base64Captcha v1.3.8
 	github.com/nwaples/rardecode v1.1.3
